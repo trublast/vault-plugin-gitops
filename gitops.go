@@ -25,7 +25,7 @@ func (b *backend) processCommit(ctx context.Context, storage logical.Storage, ha
 		return fmt.Errorf("unable to get git repository configuration: %w", err)
 	}
 
-	vaultConfig, err := vault_client.GetValidConfig(ctx, storage)
+	vaultConfig, err := vault_client.GetConfig(ctx, storage)
 	if err != nil {
 		return fmt.Errorf("unable to get vault configuration: %w", err)
 	}
@@ -62,8 +62,12 @@ func (b *backend) processCommit(ctx context.Context, storage logical.Storage, ha
 		state.Resources = make(map[string]gitops.StateResource)
 	}
 
+	vaultClient, err := vault_client.NewClientFromConfig(vaultConfig)
+	if err != nil {
+		return fmt.Errorf("vault client: %w", err)
+	}
 	writer := &storageStateWriter{storage: storage}
-	if err := gitops.Apply(ctx, resources, vaultConfig.VaultAddr, vaultConfig.VaultToken, &state, writer); err != nil {
+	if err := gitops.Apply(ctx, resources, vaultClient, &state, writer); err != nil {
 		return fmt.Errorf("gitops apply: %w", err)
 	}
 

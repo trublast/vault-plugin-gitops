@@ -50,6 +50,9 @@ func parseYAMLDocuments(data []byte) ([]Resource, error) {
 		if doc.Path == "" && doc.Data == nil && len(doc.Dependencies) == 0 && doc.Namespace == "" {
 			continue
 		}
+		if doc.Data != nil && !isObject(doc.Data) {
+			return nil, fmt.Errorf("document %d: 'data' must be an object (map)", len(resources)+1)
+		}
 		NormalizeResource(&doc)
 		resources = append(resources, doc)
 	}

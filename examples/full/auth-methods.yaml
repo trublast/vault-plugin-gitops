@@ -48,13 +48,12 @@ dependencies:
   - sys/auth/jwt
 ignore_failures: true
 data:
-  oidc_discovery_url: https://example.com/.well-known/openid-configuration
+  oidc_discovery_url: https://gitlab.com/.well-known/openid-configuration
   default_role: my-jwt-role
 ---
 path: auth/jwt/role/my-jwt-role
 dependencies:
   - auth/jwt/config
-ignore_failures: true
 data:
   role_type: jwt
   token_policies:

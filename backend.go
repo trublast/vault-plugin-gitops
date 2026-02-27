@@ -139,7 +139,7 @@ func (b *backend) SetupBackend(ctx context.Context, config *logical.BackendConfi
 
 // initializeVaultTokenExpireTime performs lookup-self and stores expire time in backend
 func (b *backend) initializeVaultTokenTTL(ctx context.Context, storage logical.Storage) error {
-	vaultConfig, err := vault_client.GetValidConfig(ctx, storage)
+	vaultConfig, err := vault_client.GetConfig(ctx, storage)
 	if err != nil {
 		return fmt.Errorf("unable to get valid vault configuration: %w", err)
 	}
@@ -157,7 +157,7 @@ func (b *backend) initializeVaultTokenTTL(ctx context.Context, storage logical.S
 // checkAndUpdateVaultTokenExpireTime checks if expire time needs to be updated and renews token if needed
 func (b *backend) checkAndUpdateVaultTokenExpireTime(ctx context.Context, storage logical.Storage) error {
 	// Get vault configuration
-	vaultConfig, err := vault_client.GetValidConfig(ctx, storage)
+	vaultConfig, err := vault_client.GetConfig(ctx, storage)
 	if err != nil {
 		return fmt.Errorf("unable to get valid vault configuration: %w", err)
 	}

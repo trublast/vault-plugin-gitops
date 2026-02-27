@@ -1,16 +1,14 @@
 package gitops
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
+
+	"github.com/hashicorp/vault/api"
 )
 
 // StateWriter is called to persist state and errors during apply.
@@ -19,13 +17,9 @@ type StateWriter interface {
 }
 
 // Apply runs vault-gitops apply: resolve templates, POST create/update, DELETE removed, update state.
-func Apply(ctx context.Context, resources []Resource, vaultAddr, token string, state *State, writer StateWriter) error {
-	vaultAddr = strings.TrimSuffix(vaultAddr, "/")
-	if vaultAddr == "" {
-		return fmt.Errorf("vault address is required")
-	}
-	if token == "" {
-		return fmt.Errorf("vault token is required")
+func Apply(ctx context.Context, resources []Resource, client *api.Client, state *State, writer StateWriter) error {
+	if client == nil {
+		return fmt.Errorf("vault client is required")
 	}
 	if state == nil || state.Resources == nil {
 		state = &State{Resources: make(map[string]StateResource)}
@@ -36,7 +30,6 @@ func Apply(ctx context.Context, resources []Resource, vaultAddr, token string, s
 		return err
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
 	currentKeys := make(map[string]bool)
 	for _, r := range resources {
 		currentKeys[r.Key()] = true
@@ -82,11 +75,27 @@ func Apply(ctx context.Context, resources []Resource, vaultAddr, token string, s
 				continue
 			}
 		}
-		url := vaultAddr + "/v1/" + strings.TrimPrefix(r.Path, "/")
+		path := strings.TrimPrefix(r.Path, "/")
+		reqClient := client
+		if r.Namespace != "" {
+			reqClient = client.WithNamespace(strings.TrimSuffix(r.Namespace, "/"))
+		}
 		method := normalizeMethod(r.Method)
-		var reqBody []byte
-		if method == http.MethodPost {
-			body, err := dataToJSON(resolvedData)
+
+		var responseData interface{}
+		var applyErr error
+		switch method {
+		case "GET":
+			secret, err := reqClient.Logical().ReadWithContext(ctx, path)
+			if err != nil {
+				applyErr = err
+				break
+			}
+			if secret != nil && secret.Data != nil {
+				responseData = normalizeValue(secret.Data)
+			}
+		default:
+			dataMap, err := dataToDataMap(resolvedData)
 			if err != nil {
 				msg := fmt.Sprintf("resource %s%s: json encode: %v", r.Namespace, r.Path, err)
 				if !r.IgnoreFailures {
@@ -94,67 +103,38 @@ func Apply(ctx context.Context, resources []Resource, vaultAddr, token string, s
 				}
 				continue
 			}
-			reqBody = []byte(body)
+			secret, err := reqClient.Logical().WriteWithContext(ctx, path, dataMap)
+			if err != nil {
+				applyErr = err
+				break
+			}
+			if secret != nil && secret.Data != nil {
+				responseData = normalizeValue(secret.Data)
+			}
 		}
-		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(reqBody))
-		if err != nil {
-			msg := fmt.Sprintf("resource %s%s: new request: %v", r.Namespace, r.Path, err)
+
+		if applyErr != nil {
+			msg := formatVaultErr(r.Namespace, r.Path, applyErr)
 			if !r.IgnoreFailures {
 				return fmt.Errorf("%s", msg)
 			}
 			continue
 		}
-		if method == http.MethodPost && len(reqBody) > 0 {
-			req.Header.Set("Content-Type", "application/json")
+		state.Resources[key] = StateResource{
+			DataDigest:     dataDigestWithRevision(resolvedData, rev),
+			Dependencies:   r.Dependencies,
+			IgnoreFailures: r.IgnoreFailures,
+			ResponseData:   responseData,
+			Namespace:      r.NamespaceOrDefault(),
+			Path:           r.Path,
 		}
-		req.Header.Set("X-Vault-Request", "true")
-		req.Header.Set("X-Vault-Token", token)
-		if r.Namespace != "" {
-			req.Header.Set("X-Vault-Namespace", r.Namespace)
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			msg := fmt.Sprintf("resource %s%s: request: %v", r.Namespace, r.Path, err)
-			if !r.IgnoreFailures {
-				return fmt.Errorf("%s", msg)
-			}
-			continue
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			var responseData interface{}
-			if len(respBody) > 0 {
-				var parsed map[string]interface{}
-				if json.Unmarshal(respBody, &parsed) == nil {
-					if d, ok := parsed["data"]; ok {
-						responseData = normalizeValue(d)
-					}
+		if writer != nil {
+			if err := writer.SaveState(ctx, state); err != nil {
+				msg := fmt.Sprintf("resource %s%s: save state: %v", r.Namespace, r.Path, err)
+				if !r.IgnoreFailures {
+					return fmt.Errorf("%s", msg)
 				}
-			}
-			state.Resources[key] = StateResource{
-				DataDigest:     dataDigestWithRevision(resolvedData, rev),
-				Dependencies:   r.Dependencies,
-				IgnoreFailures: r.IgnoreFailures,
-				ResponseData:   responseData,
-				Namespace:      r.NamespaceOrDefault(),
-				Path:           r.Path,
-			}
-			if writer != nil {
-				if err := writer.SaveState(ctx, state); err != nil {
-					msg := fmt.Sprintf("resource %s%s: save state: %v", r.Namespace, r.Path, err)
-					if !r.IgnoreFailures {
-						return fmt.Errorf("%s", msg)
-					}
-					continue
-				}
-			}
-		} else {
-			msg := fmt.Sprintf("resource %s%s: %s\n%s", r.Namespace, r.Path, resp.Status, strings.TrimSpace(string(respBody)))
-			if !r.IgnoreFailures {
-				return fmt.Errorf("%s", msg)
+				continue
 			}
 		}
 	}
@@ -169,69 +149,64 @@ func Apply(ctx context.Context, resources []Resource, vaultAddr, token string, s
 	deleteOrder := deleteOrderFromState(state, toDelete)
 	for _, key := range deleteOrder {
 		res := state.Resources[key]
-		ns, path := res.Namespace, res.Path
+		ns, path := res.Namespace, strings.TrimPrefix(res.Path, "/")
 		ignoreFailures := res.IgnoreFailures
-		url := vaultAddr + "/v1/" + strings.TrimPrefix(path, "/")
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
-		if err != nil {
-			msg := fmt.Sprintf("delete %s%s: new request: %v", ns, path, err)
-			if !ignoreFailures {
-				return fmt.Errorf("%s", msg)
-			}
-			continue
-		}
-		req.Header.Set("X-Vault-Request", "true")
-		req.Header.Set("X-Vault-Token", token)
+		reqClient := client
 		if ns != "" {
-			req.Header.Set("X-Vault-Namespace", ns)
+			reqClient = client.WithNamespace(strings.TrimSuffix(ns, "/"))
 		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			msg := fmt.Sprintf("delete %s%s: request: %v", ns, path, err)
-			if !ignoreFailures {
-				return fmt.Errorf("%s", msg)
+		_, err := reqClient.Logical().DeleteWithContext(ctx, path)
+		if err == nil {
+			delete(state.Resources, key)
+			if writer != nil {
+				if err := writer.SaveState(ctx, state); err != nil {
+					msg := fmt.Sprintf("delete %s%s: save state: %v", ns, res.Path, err)
+					if !ignoreFailures {
+						return fmt.Errorf("%s", msg)
+					}
+					continue
+				}
 			}
 			continue
 		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		switch {
-		case resp.StatusCode >= 200 && resp.StatusCode < 300:
-			// DELETE succeeded
+		respErr, ok := err.(*api.ResponseError)
+		if ok && (respErr.StatusCode == 404 || respErr.StatusCode == 405) {
 			delete(state.Resources, key)
 			if writer != nil {
 				if err := writer.SaveState(ctx, state); err != nil {
-					msg := fmt.Sprintf("delete %s%s: save state: %v", ns, path, err)
+					msg := fmt.Sprintf("delete %s%s: save state after %d: %v", ns, res.Path, respErr.StatusCode, err)
 					if !ignoreFailures {
 						return fmt.Errorf("%s", msg)
 					}
 					continue
 				}
 			}
-		case resp.StatusCode == 405 || resp.StatusCode == 404:
-			// 405 Method Not Allowed: path does not support DELETE; 404: already gone or path invalid.
-			// Remove from state and continue without calling DELETE again.
-			delete(state.Resources, key)
-			if writer != nil {
-				if err := writer.SaveState(ctx, state); err != nil {
-					msg := fmt.Sprintf("delete %s%s: save state after %s: %v", ns, path, resp.Status, err)
-					if !ignoreFailures {
-						return fmt.Errorf("%s", msg)
-					}
-					continue
-				}
-			}
-		default:
-			msg := fmt.Sprintf("delete %s%s: %s\n%s", ns, path, resp.Status, strings.TrimSpace(string(respBody)))
-			if !ignoreFailures {
-				return fmt.Errorf("%s", msg)
-			}
+			continue
+		}
+		msg := formatVaultErr(ns, res.Path, err)
+		if !ignoreFailures {
+			return fmt.Errorf("%s", msg)
 		}
 	}
 
 	return nil
+}
+
+func formatVaultErr(namespace, path string, err error) string {
+	if respErr, ok := err.(*api.ResponseError); ok {
+		return fmt.Sprintf("resource %s%s: %d %s", namespace, path, respErr.StatusCode, strings.TrimSpace(respErr.Error()))
+	}
+	return fmt.Sprintf("resource %s%s: %v", namespace, path, err)
+}
+
+// dataToDataMap converts resource data to map[string]interface{} for Vault API.
+func dataToDataMap(data interface{}) (map[string]interface{}, error) {
+	norm := normalizeValue(data)
+	m, ok := norm.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("data must be an object (map)")
+	}
+	return m, nil
 }
 
 func revisionForDigest(revision int) uint64 {
@@ -244,9 +219,9 @@ func revisionForDigest(revision int) uint64 {
 func normalizeMethod(m string) string {
 	switch strings.ToUpper(strings.TrimSpace(m)) {
 	case "GET":
-		return http.MethodGet
+		return "GET"
 	default:
-		return http.MethodPost
+		return "POST"
 	}
 }
 
@@ -259,15 +234,6 @@ func dataDigestWithRevision(data interface{}, revision uint64) string {
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
-}
-
-func dataToJSON(data interface{}) (string, error) {
-	norm := normalizeValue(data)
-	b, err := json.Marshal(norm)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
 func deleteOrderFromState(state *State, keys []string) []string {

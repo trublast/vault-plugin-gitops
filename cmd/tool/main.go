@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/hashicorp/vault/api"
 	"github.com/trublast/vault-plugin-gitops/pkg/gitops"
 )
 
@@ -103,14 +104,19 @@ func runTest(path, stateFile string) {
 		os.Exit(1)
 	}
 
-	vaultAddr := strings.TrimSpace(os.Getenv("VAULT_ADDR"))
 	token := strings.TrimSpace(os.Getenv("VAULT_TOKEN"))
-	if vaultAddr == "" {
-		fmt.Fprintln(os.Stderr, "test requires VAULT_ADDR and VAULT_TOKEN to be set")
-		os.Exit(1)
-	}
 	if token == "" {
 		fmt.Fprintln(os.Stderr, "test requires VAULT_TOKEN to be set")
+		os.Exit(1)
+	}
+	cfg := api.DefaultConfig()
+	if err := cfg.ReadEnvironment(); err != nil {
+		fmt.Fprintf(os.Stderr, "test (vault config): %v\n", err)
+		os.Exit(1)
+	}
+	vaultClient, err := api.NewClient(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "test (vault client): %v\n", err)
 		os.Exit(1)
 	}
 
@@ -133,7 +139,7 @@ func runTest(path, stateFile string) {
 	if stateFile != "" {
 		writer = fileStateWriter{filename: stateFile}
 	}
-	if err := gitops.Apply(context.Background(), resources, vaultAddr, token, state, writer); err != nil {
+	if err := gitops.Apply(context.Background(), resources, vaultClient, state, writer); err != nil {
 		fmt.Fprintf(os.Stderr, "test (apply): %v\n", err)
 		os.Exit(1)
 	}
