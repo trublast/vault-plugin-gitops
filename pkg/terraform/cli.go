@@ -133,9 +133,29 @@ func extractTerraformFiles(gitRepo *git.Repository, targetDir string, tfPath str
 			// Create target file path: extract to targetDir/tfPath/relPath
 			// This ensures files are in the correct location for terraform to work in targetDir/tfPath
 			targetPath = filepath.Join(targetDir, normalizedTfPath, relPath)
+			if strings.Contains(relPath, "..") {
+				return nil // Skip paths that would escape tfPath
+			}
 		} else {
-			// If tfPath is empty, extract files from root
-			targetPath = filepath.Join(targetDir, filePath)
+			// If tfPath is empty, extract files from root. Sanitize to prevent path traversal:
+			// reject paths that escape targetDir (e.g. ".." or "../etc/passwd" in repo).
+			if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
+				return nil // Skip invalid or escaping paths
+			}
+			targetPath = filepath.Join(targetDir, normalizedFilePath)
+		}
+
+		// Ensure resolved path stays under targetDir (defense in depth)
+		absTarget, err := filepath.Abs(targetPath)
+		if err != nil {
+			return fmt.Errorf("resolving target path %q: %w", targetPath, err)
+		}
+		absTargetDir, err := filepath.Abs(targetDir)
+		if err != nil {
+			return fmt.Errorf("resolving target dir: %w", err)
+		}
+		if !strings.HasPrefix(absTarget, absTargetDir+string(filepath.Separator)) && absTarget != absTargetDir {
+			return nil // Skip path that escapes target directory
 		}
 
 		// Create directory structure
