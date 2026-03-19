@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v6"
 
 	trdlGit "github.com/trublast/vault-plugin-gitops/pkg/git"
 )

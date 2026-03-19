@@ -5,17 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-git/go-billy/v5/memfs"
-	git "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/transport"
-	"github.com/go-git/go-git/v5/storage"
-	"github.com/go-git/go-git/v5/storage/memory"
+	"github.com/go-git/go-billy/v6/memfs"
+	git "github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
 // ErrCloneSizeLimitExceeded is returned when the repository size exceeds MaxCloneSizeBytes during in-memory clone.
@@ -25,7 +26,7 @@ type CloneOptions struct {
 	TagName           string
 	BranchName        string
 	ReferenceName     string
-	RecurseSubmodules git.SubmoduleRescursivity
+	RecurseSubmodules git.SubmoduleRecursivity
 	Auth              transport.AuthMethod
 	CABundle          []byte
 	// MaxCloneSizeBytes limits total size of objects stored during in-memory clone (0 = no limit).
@@ -40,17 +41,25 @@ type limitedStorage struct {
 	used  atomic.Int64
 }
 
-func (s *limitedStorage) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.Hash, error) {
-	size := obj.Size()
-	if size < 0 {
-		size = 0
+// RawObjectWriter checks the declared object size upfront and rejects objects
+// that would push total usage over the limit — before any data is streamed.
+// This is the primary size-limiting mechanism in go-git v6, where the packfile
+// scanner writes object data incrementally through the returned writer.
+func (s *limitedStorage) RawObjectWriter(typ plumbing.ObjectType, sz int64) (io.WriteCloser, error) {
+	if sz < 0 {
+		sz = 0
 	}
-	newUsed := s.used.Add(size)
+	newUsed := s.used.Add(sz)
 	if s.limit > 0 && newUsed > s.limit {
-		s.used.Add(-size)
-		return plumbing.ZeroHash, fmt.Errorf("%w: limit %d bytes", ErrCloneSizeLimitExceeded, s.limit)
+		s.used.Add(-sz)
+		return nil, fmt.Errorf("%w: limit %d bytes", ErrCloneSizeLimitExceeded, s.limit)
 	}
-	return s.Storage.SetEncodedObject(obj)
+	w, err := s.Storage.RawObjectWriter(typ, sz)
+	if err != nil {
+		s.used.Add(-sz)
+		return nil, err
+	}
+	return w, nil
 }
 
 func CloneInMemory(url string, opts CloneOptions) (*git.Repository, error) {
@@ -133,27 +142,32 @@ func ForEachWorktreeFile(gitRepo *git.Repository, fileFunc func(path, link strin
 		return fmt.Errorf("unable to get git repository worktree: %w", err)
 	}
 
-	fs := w.Filesystem
+	billyFS := w.Filesystem
 
-	var processFilesFunc func(directory string, files []os.FileInfo) error
-	processFilesFunc = func(directory string, fileInfoList []os.FileInfo) error {
-		for _, fileInfo := range fileInfoList {
-			absPath := path.Join(directory, fileInfo.Name())
-			if fileInfo.IsDir() {
-				fFileInfoList, err := fs.ReadDir(absPath)
+	var processFilesFunc func(directory string, entries []fs.DirEntry) error
+	processFilesFunc = func(directory string, entries []fs.DirEntry) error {
+		for _, entry := range entries {
+			absPath := path.Join(directory, entry.Name())
+			if entry.IsDir() {
+				subEntries, err := billyFS.ReadDir(absPath)
 				if err != nil {
 					return fmt.Errorf("unable to read dir %q: %w", absPath, err)
 				}
 
-				if err := processFilesFunc(absPath, fFileInfoList); err != nil {
+				if err := processFilesFunc(absPath, subEntries); err != nil {
 					return err
 				}
 
 				continue
 			}
 
+			fileInfo, err := entry.Info()
+			if err != nil {
+				return fmt.Errorf("unable to get file info for %q: %w", absPath, err)
+			}
+
 			if fileInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
-				link, err := fs.Readlink(absPath)
+				link, err := billyFS.Readlink(absPath)
 				if err != nil {
 					return fmt.Errorf("unable to read link %q: %w", absPath, err)
 				}
@@ -162,7 +176,7 @@ func ForEachWorktreeFile(gitRepo *git.Repository, fileFunc func(path, link strin
 					return err
 				}
 			} else {
-				billyFile, err := fs.Open(absPath)
+				billyFile, err := billyFS.Open(absPath)
 				if err != nil {
 					return fmt.Errorf("unable to open file %q: %w", absPath, err)
 				}
@@ -181,7 +195,7 @@ func ForEachWorktreeFile(gitRepo *git.Repository, fileFunc func(path, link strin
 	}
 
 	rootDirectory := ""
-	files, err := fs.ReadDir(rootDirectory)
+	files, err := billyFS.ReadDir(rootDirectory)
 	if err != nil {
 		return fmt.Errorf("unable to read root directory: %w", err)
 	}

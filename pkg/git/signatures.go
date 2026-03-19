@@ -7,9 +7,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/hashicorp/go-hclog"
 
 	"github.com/trublast/vault-plugin-gitops/pkg/pgp"
@@ -47,13 +47,13 @@ func VerifyTagSignatures(repo *git.Repository, tagName string, trustedPGPPublicK
 		return fmt.Errorf("unable to get tag object: %w", err)
 	}
 
-	if to.PGPSignature != "" {
+	if to.Signature != "" {
 		encoded := &plumbing.MemoryObject{}
 		if err := to.EncodeWithoutSignature(encoded); err != nil {
 			return fmt.Errorf("unable to encode tag object: %w", err)
 		}
 
-		trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, err = pgp.VerifyPGPSignatures([]string{to.PGPSignature}, func() (io.Reader, error) { return encoded.Reader() }, trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, logger)
+		trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, err = pgp.VerifyPGPSignatures([]string{to.Signature}, func() (io.Reader, error) { return encoded.Reader() }, trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, logger)
 		if err != nil {
 			return err
 		}
@@ -72,13 +72,13 @@ func VerifyCommitSignatures(repo *git.Repository, commit string, trustedPGPPubli
 		return fmt.Errorf("unable to get commit %q: %w", commit, err)
 	}
 
-	if co.PGPSignature != "" {
+	if co.Signature != "" {
 		encoded := &plumbing.MemoryObject{}
 		if err := co.EncodeWithoutSignature(encoded); err != nil {
 			return err
 		}
 
-		trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, err = pgp.VerifyPGPSignatures([]string{co.PGPSignature}, func() (io.Reader, error) { return encoded.Reader() }, trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, logger)
+		trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, err = pgp.VerifyPGPSignatures([]string{co.Signature}, func() (io.Reader, error) { return encoded.Reader() }, trustedPGPPublicKeys, requiredNumberOfVerifiedSignatures, logger)
 		if err != nil {
 			return err
 		}

@@ -7,8 +7,8 @@ import (
 	"io"
 	"time"
 
-	goGit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	goGit "github.com/go-git/go-git/v6"
+	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/logical"
 	trdlGit "github.com/trublast/vault-plugin-gitops/pkg/git"
