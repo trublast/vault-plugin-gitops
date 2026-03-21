@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/go-git/go-billy/v6"
 	"gopkg.in/yaml.v3"
 )
 
@@ -59,6 +61,25 @@ func parseYAMLDocuments(data []byte) ([]Resource, error) {
 	return resources, nil
 }
 
+// parseResourceFiles sorts file paths and parses YAML documents from each into resources.
+func parseResourceFiles(fileContents map[string][]byte) ([]Resource, error) {
+	paths := make([]string, 0, len(fileContents))
+	for p := range fileContents {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var resources []Resource
+	for _, fpath := range paths {
+		docs, err := parseYAMLDocuments(fileContents[fpath])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", fpath, err)
+		}
+		resources = append(resources, docs...)
+	}
+	return resources, nil
+}
+
 // LoadResourcesFromPath loads resources from a file or directory.
 // If path is a directory, all .yaml and .yml files under it (recursive) are collected and parsed.
 // If path is a file, that file is read. Returns parsed and normalized resources.
@@ -80,17 +101,72 @@ func LoadResourcesFromPath(path string) ([]Resource, error) {
 		files = []string{path}
 	}
 
-	var resources []Resource
+	fileContents := make(map[string][]byte, len(files))
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", f, err)
 		}
-		docs, err := parseYAMLDocuments(data)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", f, err)
-		}
-		resources = append(resources, docs...)
+		fileContents[f] = data
 	}
-	return resources, nil
+	return parseResourceFiles(fileContents)
+}
+
+// LoadResourcesFromFS extracts .yaml/.yml files from the given filesystem under rootPath and parses them into resources.
+func LoadResourcesFromFS(worktreeFS billy.Filesystem, rootPath string) ([]Resource, error) {
+	fileContents := make(map[string][]byte)
+	normalizedPath := filepath.Clean(rootPath)
+	if normalizedPath == "." {
+		normalizedPath = ""
+	}
+
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		entries, err := worktreeFS.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("reading directory %q: %w", dir, err)
+		}
+		for _, entry := range entries {
+			filePath := path.Join(dir, entry.Name())
+			if entry.IsDir() {
+				if err := walk(filePath); err != nil {
+					return err
+				}
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return fmt.Errorf("file info for %q: %w", filePath, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			ext := strings.ToLower(path.Ext(entry.Name()))
+			if ext != ".yaml" && ext != ".yml" {
+				continue
+			}
+			normalizedFilePath := filepath.Clean(filePath)
+			if normalizedPath != "" {
+				if normalizedFilePath != normalizedPath && !strings.HasPrefix(normalizedFilePath, normalizedPath+string(filepath.Separator)) {
+					continue
+				}
+			}
+			f, err := worktreeFS.Open(filePath)
+			if err != nil {
+				return fmt.Errorf("opening %q: %w", filePath, err)
+			}
+			data, err := io.ReadAll(f)
+			f.Close()
+			if err != nil {
+				return fmt.Errorf("reading %q: %w", filePath, err)
+			}
+			fileContents[filePath] = data
+		}
+		return nil
+	}
+
+	if err := walk(""); err != nil {
+		return nil, err
+	}
+	return parseResourceFiles(fileContents)
 }

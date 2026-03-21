@@ -8,13 +8,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
-	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-billy/v6"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/logical"
-	trdlGit "github.com/trublast/vault-plugin-gitops/pkg/git"
 )
 
 const (
@@ -34,8 +34,8 @@ type CLIConfig struct {
 	Logger         hclog.Logger
 }
 
-// ApplyTerraformFromRepo extracts terraform files from git repository and applies them using Terraform CLI
-func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config CLIConfig) error {
+// ApplyTerraformFromFS extracts terraform files from the given filesystem and applies them using Terraform CLI.
+func ApplyTerraformFromFS(ctx context.Context, worktreeFS billy.Filesystem, config CLIConfig) error {
 	// Create temporary directory for terraform files
 	tmpDir, err := os.MkdirTemp("", "vault-plugin-terraform-*")
 	if err != nil {
@@ -58,7 +58,7 @@ func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config
 	config.Logger.Debug(fmt.Sprintf("Created temporary directory for terraform: %q", tmpDir))
 
 	// Extract terraform files from repository
-	tfFiles, err := extractTerraformFiles(gitRepo, tmpDir, config.TfPath, config.Logger)
+	tfFiles, err := extractTerraformFiles(worktreeFS, tmpDir, config.TfPath, config.Logger)
 	if err != nil {
 		return fmt.Errorf("extracting terraform files: %w", err)
 	}
@@ -97,89 +97,101 @@ func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config
 	return nil
 }
 
-// extractTerraformFiles extracts .tf and .hcl files from git repository to temporary directory
-func extractTerraformFiles(gitRepo *git.Repository, targetDir string, tfPath string, logger hclog.Logger) ([]string, error) {
+// extractTerraformFiles extracts files from the given filesystem to temporary directory.
+func extractTerraformFiles(worktreeFS billy.Filesystem, targetDir string, tfPath string, logger hclog.Logger) ([]string, error) {
 	var tfFiles []string
 
-	// Normalize tfPath for comparison
 	normalizedTfPath := filepath.Clean(tfPath)
 	if normalizedTfPath == "." {
 		normalizedTfPath = ""
 	}
 
-	err := trdlGit.ForEachWorktreeFile(gitRepo, func(filePath, link string, fileReader io.Reader, info os.FileInfo) error {
-		// Skip directories and symlinks
-		if info.IsDir() || link != "" {
-			return nil
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		entries, err := worktreeFS.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("reading directory %q: %w", dir, err)
 		}
-
-		// Normalize file path for comparison
-		normalizedFilePath := filepath.Clean(filePath)
-
-		// Filter files by tfPath: if tfPath is set, only extract files from that directory
-		var targetPath string
-		if normalizedTfPath != "" {
-			// Check if file is in the tfPath directory
-			// filePath should start with tfPath/ or be exactly tfPath
-			if normalizedFilePath != normalizedTfPath && !strings.HasPrefix(normalizedFilePath, normalizedTfPath+string(filepath.Separator)) {
-				return nil // Skip files outside tfPath
+		for _, entry := range entries {
+			filePath := path.Join(dir, entry.Name())
+			if entry.IsDir() {
+				if err := walk(filePath); err != nil {
+					return err
+				}
+				continue
 			}
-
-			// Calculate relative path from tfPath for target directory structure
-			relPath, err := filepath.Rel(normalizedTfPath, normalizedFilePath)
+			info, err := entry.Info()
 			if err != nil {
-				return fmt.Errorf("calculating relative path for %q: %w", filePath, err)
+				return fmt.Errorf("file info for %q: %w", filePath, err)
 			}
-			// Create target file path: extract to targetDir/tfPath/relPath
-			// This ensures files are in the correct location for terraform to work in targetDir/tfPath
-			targetPath = filepath.Join(targetDir, normalizedTfPath, relPath)
-			if strings.Contains(relPath, "..") {
-				return nil // Skip paths that would escape tfPath
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
 			}
-		} else {
-			// If tfPath is empty, extract files from root. Sanitize to prevent path traversal:
-			// reject paths that escape targetDir (e.g. ".." or "../etc/passwd" in repo).
-			if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
-				return nil // Skip invalid or escaping paths
+
+			normalizedFilePath := filepath.Clean(filePath)
+
+			var targetPath string
+			if normalizedTfPath != "" {
+				if normalizedFilePath != normalizedTfPath && !strings.HasPrefix(normalizedFilePath, normalizedTfPath+string(filepath.Separator)) {
+					continue
+				}
+				relPath, err := filepath.Rel(normalizedTfPath, normalizedFilePath)
+				if err != nil {
+					return fmt.Errorf("calculating relative path for %q: %w", filePath, err)
+				}
+				if strings.Contains(relPath, "..") {
+					continue
+				}
+				targetPath = filepath.Join(targetDir, normalizedTfPath, relPath)
+			} else {
+				if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
+					continue
+				}
+				targetPath = filepath.Join(targetDir, normalizedFilePath)
 			}
-			targetPath = filepath.Join(targetDir, normalizedFilePath)
-		}
 
-		// Ensure resolved path stays under targetDir (defense in depth)
-		absTarget, err := filepath.Abs(targetPath)
-		if err != nil {
-			return fmt.Errorf("resolving target path %q: %w", targetPath, err)
-		}
-		absTargetDir, err := filepath.Abs(targetDir)
-		if err != nil {
-			return fmt.Errorf("resolving target dir: %w", err)
-		}
-		if !strings.HasPrefix(absTarget, absTargetDir+string(filepath.Separator)) && absTarget != absTargetDir {
-			return nil // Skip path that escapes target directory
-		}
+			// Ensure resolved path stays under targetDir (defense in depth)
+			absTarget, err := filepath.Abs(targetPath)
+			if err != nil {
+				return fmt.Errorf("resolving target path %q: %w", targetPath, err)
+			}
+			absTargetDir, err := filepath.Abs(targetDir)
+			if err != nil {
+				return fmt.Errorf("resolving target dir: %w", err)
+			}
+			if !strings.HasPrefix(absTarget, absTargetDir+string(filepath.Separator)) && absTarget != absTargetDir {
+				continue
+			}
 
-		// Create directory structure
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-			return fmt.Errorf("creating directory for %q: %w", filePath, err)
-		}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				return fmt.Errorf("creating directory for %q: %w", filePath, err)
+			}
 
-		// Create and write file
-		targetFile, err := os.Create(targetPath)
-		if err != nil {
-			return fmt.Errorf("creating file %q: %w", targetPath, err)
-		}
-		defer targetFile.Close()
+			srcFile, err := worktreeFS.Open(filePath)
+			if err != nil {
+				return fmt.Errorf("opening %q: %w", filePath, err)
+			}
 
-		if _, err := io.Copy(targetFile, fileReader); err != nil {
-			return fmt.Errorf("copying file %q: %w", filePath, err)
-		}
+			dstFile, err := os.Create(targetPath)
+			if err != nil {
+				srcFile.Close()
+				return fmt.Errorf("creating file %q: %w", targetPath, err)
+			}
 
-		tfFiles = append(tfFiles, targetPath)
-		logger.Debug(fmt.Sprintf("Extracted terraform file: %q", filePath))
+			_, copyErr := io.Copy(dstFile, srcFile)
+			srcFile.Close()
+			dstFile.Close()
+			if copyErr != nil {
+				return fmt.Errorf("copying file %q: %w", filePath, copyErr)
+			}
+
+			tfFiles = append(tfFiles, targetPath)
+			logger.Debug(fmt.Sprintf("Extracted terraform file: %q", filePath))
+		}
 		return nil
-	})
+	}
 
-	if err != nil {
+	if err := walk(""); err != nil {
 		return nil, err
 	}
 
