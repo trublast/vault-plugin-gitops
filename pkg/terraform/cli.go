@@ -13,11 +13,25 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/logical"
 )
+
+const tmpfsMagic = 0x01021994
+
+// inMemoryTempDir returns a tmpfs-backed directory suitable for os.MkdirTemp.
+// It prefers /dev/shm (guaranteed tmpfs on Linux), falls back to the default
+// temp directory if /tmp is already tmpfs, or returns "" as a last resort.
+func inMemoryTempDir() string {
+	var stat syscall.Statfs_t
+	if syscall.Statfs("/dev/shm", &stat) == nil && stat.Type == tmpfsMagic {
+		return "/dev/shm"
+	}
+	return ""
+}
 
 const (
 	// StorageKeyTerraformState is the key for storing terraform state in storage
@@ -37,18 +51,29 @@ type CLIConfig struct {
 }
 
 // ApplyTerraformFromFS extracts terraform files from the given filesystem and applies them using Terraform CLI.
+//
+// Directory layout inside tmpDir:
+//
+//	tmpDir/
+//	├── workspace/   ← .tf files extracted here (CWD for terraform)
+//	└── .rootfs/     ← sandbox skeleton (only in sandboxed mode)
+//
+// Files under config.TfPath are extracted directly into workspace/ without
+// the prefix, so terraform always runs from workspace/.  The .rootfs
+// sibling is derived from workDir by newSandboxedCommand and never appears
+// inside /workspace after pivot_root.
 func ApplyTerraformFromFS(ctx context.Context, worktreeFS billy.Filesystem, config CLIConfig) error {
-	// Create temporary directory for terraform files
-	tmpDir, err := os.MkdirTemp("", "vault-plugin-terraform-*")
+	// Create temporary directory on a tmpfs-backed filesystem so that
+	// sensitive .tf content never touches persistent storage.
+	tmpDir, err := os.MkdirTemp(inMemoryTempDir(), "vault-plugin-terraform-*")
 	if err != nil {
 		return fmt.Errorf("creating temporary directory: %w", err)
 	}
 
-	// Save state before cleanup (even if there was an error)
-	defer func() {
+	workDir := filepath.Join(tmpDir, "workspace")
+	statePath := filepath.Join(workDir, "terraform.tfstate")
 
-		// Save state before removing directory
-		statePath := filepath.Join(tmpDir, config.TfPath, "terraform.tfstate")
+	defer func() {
 		if stateData, readErr := os.ReadFile(statePath); readErr == nil && len(stateData) > 0 {
 			if saveErr := saveTerraformState(ctx, stateData, config); saveErr != nil {
 				config.Logger.Warn(fmt.Sprintf("Failed to save terraform state: %v", saveErr))
@@ -59,8 +84,7 @@ func ApplyTerraformFromFS(ctx context.Context, worktreeFS billy.Filesystem, conf
 
 	config.Logger.Debug(fmt.Sprintf("Created temporary directory for terraform: %q", tmpDir))
 
-	// Extract terraform files from repository
-	tfFiles, err := extractTerraformFiles(worktreeFS, tmpDir, config.TfPath, config.Logger)
+	tfFiles, err := extractTerraformFiles(worktreeFS, workDir, config.TfPath, config.Logger)
 	if err != nil {
 		return fmt.Errorf("extracting terraform files: %w", err)
 	}
@@ -69,30 +93,20 @@ func ApplyTerraformFromFS(ctx context.Context, worktreeFS billy.Filesystem, conf
 		config.Logger.Info("No terraform files found in repository")
 		return nil
 	}
-	tfDir := filepath.Join(tmpDir, config.TfPath)
 
-	fileInfo, err := os.Stat(tfDir)
-	if err != nil || !fileInfo.IsDir() {
-		return fmt.Errorf("%q is not a directory", config.TfPath)
-	}
-
-	// Load terraform state from storage if it exists
-	if err := loadTerraformState(ctx, tfDir, config); err != nil {
+	if err := loadTerraformState(ctx, statePath, config); err != nil {
 		return fmt.Errorf("loading terraform state: %w", err)
 	}
 
-	// Run terraform init
-	if err := runTerraformInit(ctx, tfDir, config); err != nil {
+	if err := runTerraformInit(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform init: %w", err)
 	}
 
-	// Run terraform plan
-	if err := runTerraformPlan(ctx, tfDir, config); err != nil {
+	if err := runTerraformPlan(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform plan: %w", err)
 	}
 
-	// Run terraform apply
-	if err := runTerraformApply(ctx, tfDir, config); err != nil {
+	if err := runTerraformApply(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
@@ -144,7 +158,7 @@ func extractTerraformFiles(worktreeFS billy.Filesystem, targetDir string, tfPath
 				if strings.Contains(relPath, "..") {
 					continue
 				}
-				targetPath = filepath.Join(targetDir, normalizedTfPath, relPath)
+				targetPath = filepath.Join(targetDir, relPath)
 			} else {
 				if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
 					continue
@@ -293,8 +307,7 @@ func runTerraformApply(ctx context.Context, workDir string, config CLIConfig) er
 	return nil
 }
 
-// loadTerraformState loads terraform state from storage and writes it to workDir
-func loadTerraformState(ctx context.Context, workDir string, config CLIConfig) error {
+func loadTerraformState(ctx context.Context, statePath string, config CLIConfig) error {
 	if config.Storage == nil {
 		config.Logger.Debug("Storage not provided, skipping state load")
 		return nil
@@ -310,8 +323,6 @@ func loadTerraformState(ctx context.Context, workDir string, config CLIConfig) e
 		return nil
 	}
 
-	// Write state file to workDir
-	statePath := filepath.Join(workDir, "terraform.tfstate")
 	if err := os.WriteFile(statePath, entry.Value, 0600); err != nil {
 		return fmt.Errorf("writing terraform state file: %w", err)
 	}

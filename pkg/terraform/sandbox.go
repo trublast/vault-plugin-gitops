@@ -89,8 +89,9 @@ func newSandboxedCommand(ctx context.Context, workDir string, config CLIConfig, 
 	var cmd *exec.Cmd
 	sandboxed := false
 
+	rootfsDir := filepath.Join(filepath.Dir(workDir), ".rootfs")
+
 	if initPath, err := sandboxInitFD(); err == nil {
-		rootfsDir := filepath.Join(workDir, ".rootfs")
 		if mkErr := os.MkdirAll(rootfsDir, 0700); mkErr != nil {
 			logger.Warn("Failed to create rootfs dir, falling back", "error", mkErr)
 		} else {
@@ -111,7 +112,6 @@ func newSandboxedCommand(ctx context.Context, workDir string, config CLIConfig, 
 	cmd.Dir = workDir
 	env := buildCleanEnv(config, workDir, sandboxed)
 	if sandboxed {
-		rootfsDir := filepath.Join(workDir, ".rootfs")
 		env = append(env, "SANDBOX_ROOTFS="+rootfsDir)
 	}
 	cmd.Env = env
