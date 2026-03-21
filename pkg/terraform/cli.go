@@ -1,3 +1,5 @@
+//go:build linux
+
 package terraform
 
 import (
@@ -199,40 +201,32 @@ func extractTerraformFiles(worktreeFS billy.Filesystem, targetDir string, tfPath
 	return tfFiles, nil
 }
 
-// setupTerraformConfigFile checks for .terraformrc in workDir and sets TF_CLI_CONFIG_FILE env var if found
+// setupTerraformConfigFile sets TF_CLI_CONFIG_FILE on the command.
+// Uses a relative path (".terraformrc") so it works both on the host
+// filesystem and inside the pivot_root'd sandbox (CWD = /workspace).
+// Host TF_CLI_CONFIG_FILE takes priority when running without rootfs
+// isolation; inside the sandbox it is ignored because the host path
+// would not exist after pivot_root.
 func setupTerraformConfigFile(workDir string, cmd *exec.Cmd) {
-	tfConfig := os.Getenv("TF_CLI_CONFIG_FILE")
-	// Env exists, use env value
-	if tfConfig != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TF_CLI_CONFIG_FILE=%s", tfConfig))
+	if v := os.Getenv("TF_CLI_CONFIG_FILE"); v != "" {
+		cmd.Env = append(cmd.Env, "TF_CLI_CONFIG_FILE="+v)
 		return
 	}
 	terraformrcPath := filepath.Join(workDir, ".terraformrc")
 	if _, err := os.Stat(terraformrcPath); err == nil {
-		// File exists, set environment variable
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TF_CLI_CONFIG_FILE=%s", terraformrcPath))
+		cmd.Env = append(cmd.Env, "TF_CLI_CONFIG_FILE=.terraformrc")
 	}
 }
 
-// runTerraformInit runs terraform init
 func runTerraformInit(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "init", "-no-color", "-input=false")
-	cmd.Dir = workDir
+	cmd := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "init", "-no-color", "-input=false")
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -249,34 +243,15 @@ func runTerraformInit(ctx context.Context, workDir string, config CLIConfig) err
 	return nil
 }
 
-// runTerraformPlan runs terraform plan
 func runTerraformPlan(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "plan", "-no-color", "-input=false", "-out=tfplan")
-	cmd.Dir = workDir
+	cmd := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "plan", "-no-color", "-input=false", "-out=tfplan")
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-	if config.VaultAddr != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_ADDR=%s", config.VaultAddr))
-	}
-	if config.VaultToken != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_TOKEN=%s", config.VaultToken))
-	}
-	if config.VaultNamespace != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_NAMESPACE=%s", config.VaultNamespace))
-	}
-
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -293,34 +268,15 @@ func runTerraformPlan(ctx context.Context, workDir string, config CLIConfig) err
 	return nil
 }
 
-// runTerraformApply runs terraform apply with the plan file and returns the state
-// State is returned even if apply failed, so it can be saved for debugging/recovery
 func runTerraformApply(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "apply", "-no-color", "-input=false", "-auto-approve", "tfplan")
-	cmd.Dir = workDir
+	cmd := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "apply", "-no-color", "-input=false", "-auto-approve", "tfplan")
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-	if config.VaultAddr != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_ADDR=%s", config.VaultAddr))
-	}
-	if config.VaultToken != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_TOKEN=%s", config.VaultToken))
-	}
-	if config.VaultNamespace != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_NAMESPACE=%s", config.VaultNamespace))
-	}
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -442,10 +398,7 @@ func verifyTfBinarySHA256(path, expectedHex string) error {
 		return fmt.Errorf("reading terraform binary for checksum: %w", err)
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	expected := strings.ToLower(strings.TrimSpace(expectedHex))
-	if strings.HasPrefix(expected, "0x") {
-		expected = expected[2:]
-	}
+	expected := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(expectedHex)), "0x")
 	if got != expected {
 		return fmt.Errorf("terraform binary SHA256 mismatch at %q: got %s, expected %s", path, got, expectedHex)
 	}
