@@ -83,7 +83,7 @@ func newBackend(c *logical.BackendConfig) (*backend, error) {
 		Help:        backendHelp,
 
 		PeriodicFunc: func(ctx context.Context, req *logical.Request) error {
-			return b.PeriodicTask(req.Storage)
+			return b.PeriodicTask(ctx, req.Storage)
 		},
 		PathsSpecial: &logical.Paths{
 			SealWrapStorage: []string{

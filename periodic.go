@@ -37,28 +37,29 @@ const (
 	storageKeyProcessStatus      = "process_status"
 )
 
-func (b *backend) PeriodicTask(storage logical.Storage) error {
-	ctx := context.Background()
+func (b *backend) PeriodicTask(ctx context.Context, storage logical.Storage) error {
 
 	// Check and update vault token expire time if needed (using vault_client functions)
 	// Run asynchronously to avoid blocking PeriodicTask
 	go func() {
-		if err := b.checkAndUpdateVaultTokenExpireTime(context.Background(), storage); err != nil {
+		token_ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := b.checkAndUpdateVaultTokenExpireTime(token_ctx, storage); err != nil {
 			b.Logger().Warn(fmt.Sprintf("Failed to check/update vault token expire time: %v", err))
 		}
 	}()
+
+	// Check if processGit is already running using CAS guard
+	if !atomic.CompareAndSwapUint32(b.processGitCASGuard, 0, 1) {
+		b.Logger().Debug("GitOps task already in progress, skipping this iteration")
+		return nil
+	}
 
 	// Get last finished commit
 	var lastFinishedCommit *LastFinishedCommit
 	err := util.GetJSON(ctx, storage, storageKeyLastFinishedCommit, &lastFinishedCommit)
 	if err != nil {
 		return fmt.Errorf("unable to get last finished commit: %w", err)
-	}
-
-	// Check if processGit is already running using CAS guard
-	if !atomic.CompareAndSwapUint32(b.processGitCASGuard, 0, 1) {
-		b.Logger().Debug("GitOps task already in progress, skipping this iteration")
-		return nil
 	}
 
 	// Launch processGit in a goroutine to avoid blocking PeriodicTask
@@ -73,7 +74,8 @@ func (b *backend) processGitInternal(storage logical.Storage, lastFinishedCommit
 	defer atomic.StoreUint32(b.processGitCASGuard, 0)
 
 	// Don't cancel when the original client request goes away
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
 
 	if err := b.processGit(ctx, storage, lastFinishedCommit); err != nil {
 		b.Logger().Warn(fmt.Sprintf("Cant process gitops task: %v", err))
