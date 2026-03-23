@@ -2,8 +2,28 @@ report_sizes: false
 version: 2
 
 builds:
-  # Vault plugin binary (cmd/plugin-gitops)
+  # Vault plugin binary with sandboxed terraform (cmd/plugin-gitops), only for linux
   - id: gitops
+    main: ./cmd/plugin-gitops
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -extldflags -static
+      - -X {{.ModulePath}}.projectVersion=v{{.Version}}
+    binary: "gitops-{{ .Os }}-{{ .Arch }}"
+
+  # Vault plugin binary without terraform (cmd/plugin-gitops, tag no_terraform)
+  - id: gitops-notf
     main: ./cmd/plugin-gitops
     env:
       - CGO_ENABLED=0
@@ -17,13 +37,14 @@ builds:
     mod_timestamp: "{{ .CommitTimestamp }}"
     flags:
       - -trimpath
+    tags:
+      - no_terraform
     ldflags:
       - -s
       - -w
       - -extldflags -static
-      # package plugin_gitops is in repo root, so import path = ModulePath
       - -X {{.ModulePath}}.projectVersion=v{{.Version}}
-    binary: "gitops-{{ .Os }}-{{ .Arch }}"
+    binary: "gitops-notf-{{ .Os }}-{{ .Arch }}"
 
   # CLI tool (cmd/tool)
   - id: gitops-tool
@@ -53,6 +74,11 @@ archives:
     name_template: "gitops-{{ .Os }}-{{ .Arch }}"
     ids:
       - gitops
+  - id: gitops-notf
+    formats: [binary]
+    name_template: "gitops-notf-{{ .Os }}-{{ .Arch }}"
+    ids:
+      - gitops-notf
   - id: gitops-tool
     formats: [binary]
     name_template: "gitops-tool-{{ .Os }}-{{ .Arch }}"
