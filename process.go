@@ -19,7 +19,11 @@ func (b *backend) processCommitWithRepo(ctx context.Context, storage logical.Sto
 
 // processCommitWithRepoAtHead delegates to the active engine (worktree must already be at the desired commit).
 func (b *backend) processCommitWithRepoAtHead(ctx context.Context, storage logical.Storage, gitRepo *git.Repository) error {
-	return b.engine.ProcessCommit(ctx, storage, gitRepo, b.Logger())
+	wt, err := gitRepo.Worktree()
+	if err != nil {
+		return fmt.Errorf("getting worktree: %w", err)
+	}
+	return b.engine.ProcessCommit(ctx, storage, wt.Filesystem, b.Logger())
 }
 
 // checkoutRepoToCommit checkouts the repository worktree to the given commit.

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -141,9 +142,11 @@ func ForEachWorktreeFile(gitRepo *git.Repository, fileFunc func(path, link strin
 	if err != nil {
 		return fmt.Errorf("unable to get git repository worktree: %w", err)
 	}
+	return ForEachFile(w.Filesystem, fileFunc)
+}
 
-	billyFS := w.Filesystem
-
+// ForEachFile walks all files in the given billy filesystem and calls fileFunc for each.
+func ForEachFile(billyFS billy.Filesystem, fileFunc func(path, link string, fileReader io.Reader, info os.FileInfo) error) error {
 	var processFilesFunc func(directory string, entries []fs.DirEntry) error
 	processFilesFunc = func(directory string, entries []fs.DirEntry) error {
 		for _, entry := range entries {

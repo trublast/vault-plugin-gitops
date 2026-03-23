@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-billy/v6"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -15,7 +15,7 @@ import (
 // Implementations self-register via init() so build tags can control which
 // engines are compiled into the binary.
 type Engine interface {
-	ProcessCommit(ctx context.Context, storage logical.Storage, gitRepo *git.Repository, logger hclog.Logger) error
+	ProcessCommit(ctx context.Context, storage logical.Storage, worktreeFS billy.Filesystem, logger hclog.Logger) error
 	Paths(baseBackend *framework.Backend) []*framework.Path
 }
 

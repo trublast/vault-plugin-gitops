@@ -1,3 +1,5 @@
+//go:build linux
+
 package terraform
 
 import (
@@ -8,14 +10,28 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
-	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-billy/v6"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/logical"
-	trdlGit "github.com/trublast/vault-plugin-gitops/pkg/git"
 )
+
+const tmpfsMagic = 0x01021994
+
+// inMemoryTempDir returns a tmpfs-backed directory suitable for os.MkdirTemp.
+// It prefers /dev/shm (guaranteed tmpfs on Linux), falls back to the default
+// temp directory if /tmp is already tmpfs, or returns "" as a last resort.
+func inMemoryTempDir() string {
+	var stat syscall.Statfs_t
+	if syscall.Statfs("/dev/shm", &stat) == nil && stat.Type == tmpfsMagic {
+		return "/dev/shm"
+	}
+	return ""
+}
 
 const (
 	// StorageKeyTerraformState is the key for storing terraform state in storage
@@ -34,19 +50,30 @@ type CLIConfig struct {
 	Logger         hclog.Logger
 }
 
-// ApplyTerraformFromRepo extracts terraform files from git repository and applies them using Terraform CLI
-func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config CLIConfig) error {
-	// Create temporary directory for terraform files
-	tmpDir, err := os.MkdirTemp("", "vault-plugin-terraform-*")
+// ApplyTerraformFromFS extracts terraform files from the given filesystem and applies them using Terraform CLI.
+//
+// Directory layout inside tmpDir:
+//
+//	tmpDir/
+//	├── workspace/   ← .tf files extracted here (CWD for terraform)
+//	└── .rootfs/     ← sandbox skeleton (only in sandboxed mode)
+//
+// Files under config.TfPath are extracted directly into workspace/ without
+// the prefix, so terraform always runs from workspace/.  The .rootfs
+// sibling is derived from workDir by newSandboxedCommand and never appears
+// inside /workspace after pivot_root.
+func ApplyTerraformFromFS(ctx context.Context, worktreeFS billy.Filesystem, config CLIConfig) error {
+	// Create temporary directory on a tmpfs-backed filesystem so that
+	// sensitive .tf content never touches persistent storage.
+	tmpDir, err := os.MkdirTemp(inMemoryTempDir(), "vault-plugin-terraform-*")
 	if err != nil {
 		return fmt.Errorf("creating temporary directory: %w", err)
 	}
 
-	// Save state before cleanup (even if there was an error)
-	defer func() {
+	workDir := filepath.Join(tmpDir, "workspace")
+	statePath := filepath.Join(workDir, "terraform.tfstate")
 
-		// Save state before removing directory
-		statePath := filepath.Join(tmpDir, config.TfPath, "terraform.tfstate")
+	defer func() {
 		if stateData, readErr := os.ReadFile(statePath); readErr == nil && len(stateData) > 0 {
 			if saveErr := saveTerraformState(ctx, stateData, config); saveErr != nil {
 				config.Logger.Warn(fmt.Sprintf("Failed to save terraform state: %v", saveErr))
@@ -57,8 +84,7 @@ func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config
 
 	config.Logger.Debug(fmt.Sprintf("Created temporary directory for terraform: %q", tmpDir))
 
-	// Extract terraform files from repository
-	tfFiles, err := extractTerraformFiles(gitRepo, tmpDir, config.TfPath, config.Logger)
+	tfFiles, err := extractTerraformFiles(worktreeFS, workDir, config.TfPath, config.Logger)
 	if err != nil {
 		return fmt.Errorf("extracting terraform files: %w", err)
 	}
@@ -67,119 +93,121 @@ func ApplyTerraformFromRepo(ctx context.Context, gitRepo *git.Repository, config
 		config.Logger.Info("No terraform files found in repository")
 		return nil
 	}
-	tfDir := filepath.Join(tmpDir, config.TfPath)
 
-	fileInfo, err := os.Stat(tfDir)
-	if err != nil || !fileInfo.IsDir() {
-		return fmt.Errorf("%q is not a directory", config.TfPath)
-	}
-
-	// Load terraform state from storage if it exists
-	if err := loadTerraformState(ctx, tfDir, config); err != nil {
+	if err := loadTerraformState(ctx, statePath, config); err != nil {
 		return fmt.Errorf("loading terraform state: %w", err)
 	}
 
-	// Run terraform init
-	if err := runTerraformInit(ctx, tfDir, config); err != nil {
+	if err := runTerraformInit(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform init: %w", err)
 	}
 
-	// Run terraform plan
-	if err := runTerraformPlan(ctx, tfDir, config); err != nil {
+	if err := runTerraformPlan(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform plan: %w", err)
 	}
 
-	// Run terraform apply
-	if err := runTerraformApply(ctx, tfDir, config); err != nil {
+	if err := runTerraformApply(ctx, workDir, config); err != nil {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 
 	return nil
 }
 
-// extractTerraformFiles extracts .tf and .hcl files from git repository to temporary directory
-func extractTerraformFiles(gitRepo *git.Repository, targetDir string, tfPath string, logger hclog.Logger) ([]string, error) {
+// extractTerraformFiles extracts files from the given filesystem to temporary directory.
+func extractTerraformFiles(worktreeFS billy.Filesystem, targetDir string, tfPath string, logger hclog.Logger) ([]string, error) {
 	var tfFiles []string
 
-	// Normalize tfPath for comparison
 	normalizedTfPath := filepath.Clean(tfPath)
 	if normalizedTfPath == "." {
 		normalizedTfPath = ""
 	}
 
-	err := trdlGit.ForEachWorktreeFile(gitRepo, func(filePath, link string, fileReader io.Reader, info os.FileInfo) error {
-		// Skip directories and symlinks
-		if info.IsDir() || link != "" {
-			return nil
+	var walk func(dir string) error
+	walk = func(dir string) error {
+		entries, err := worktreeFS.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("reading directory %q: %w", dir, err)
 		}
-
-		// Normalize file path for comparison
-		normalizedFilePath := filepath.Clean(filePath)
-
-		// Filter files by tfPath: if tfPath is set, only extract files from that directory
-		var targetPath string
-		if normalizedTfPath != "" {
-			// Check if file is in the tfPath directory
-			// filePath should start with tfPath/ or be exactly tfPath
-			if normalizedFilePath != normalizedTfPath && !strings.HasPrefix(normalizedFilePath, normalizedTfPath+string(filepath.Separator)) {
-				return nil // Skip files outside tfPath
+		for _, entry := range entries {
+			filePath := path.Join(dir, entry.Name())
+			if entry.IsDir() {
+				if err := walk(filePath); err != nil {
+					return err
+				}
+				continue
 			}
-
-			// Calculate relative path from tfPath for target directory structure
-			relPath, err := filepath.Rel(normalizedTfPath, normalizedFilePath)
+			info, err := entry.Info()
 			if err != nil {
-				return fmt.Errorf("calculating relative path for %q: %w", filePath, err)
+				return fmt.Errorf("file info for %q: %w", filePath, err)
 			}
-			// Create target file path: extract to targetDir/tfPath/relPath
-			// This ensures files are in the correct location for terraform to work in targetDir/tfPath
-			targetPath = filepath.Join(targetDir, normalizedTfPath, relPath)
-			if strings.Contains(relPath, "..") {
-				return nil // Skip paths that would escape tfPath
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
 			}
-		} else {
-			// If tfPath is empty, extract files from root. Sanitize to prevent path traversal:
-			// reject paths that escape targetDir (e.g. ".." or "../etc/passwd" in repo).
-			if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
-				return nil // Skip invalid or escaping paths
+
+			normalizedFilePath := filepath.Clean(filePath)
+
+			var targetPath string
+			if normalizedTfPath != "" {
+				if normalizedFilePath != normalizedTfPath && !strings.HasPrefix(normalizedFilePath, normalizedTfPath+string(filepath.Separator)) {
+					continue
+				}
+				relPath, err := filepath.Rel(normalizedTfPath, normalizedFilePath)
+				if err != nil {
+					return fmt.Errorf("calculating relative path for %q: %w", filePath, err)
+				}
+				if strings.Contains(relPath, "..") {
+					continue
+				}
+				targetPath = filepath.Join(targetDir, relPath)
+			} else {
+				if normalizedFilePath == "" || strings.Contains(normalizedFilePath, "..") || filepath.IsAbs(normalizedFilePath) {
+					continue
+				}
+				targetPath = filepath.Join(targetDir, normalizedFilePath)
 			}
-			targetPath = filepath.Join(targetDir, normalizedFilePath)
-		}
 
-		// Ensure resolved path stays under targetDir (defense in depth)
-		absTarget, err := filepath.Abs(targetPath)
-		if err != nil {
-			return fmt.Errorf("resolving target path %q: %w", targetPath, err)
-		}
-		absTargetDir, err := filepath.Abs(targetDir)
-		if err != nil {
-			return fmt.Errorf("resolving target dir: %w", err)
-		}
-		if !strings.HasPrefix(absTarget, absTargetDir+string(filepath.Separator)) && absTarget != absTargetDir {
-			return nil // Skip path that escapes target directory
-		}
+			// Ensure resolved path stays under targetDir (defense in depth)
+			absTarget, err := filepath.Abs(targetPath)
+			if err != nil {
+				return fmt.Errorf("resolving target path %q: %w", targetPath, err)
+			}
+			absTargetDir, err := filepath.Abs(targetDir)
+			if err != nil {
+				return fmt.Errorf("resolving target dir: %w", err)
+			}
+			if !strings.HasPrefix(absTarget, absTargetDir+string(filepath.Separator)) && absTarget != absTargetDir {
+				continue
+			}
 
-		// Create directory structure
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-			return fmt.Errorf("creating directory for %q: %w", filePath, err)
-		}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
+				return fmt.Errorf("creating directory for %q: %w", filePath, err)
+			}
 
-		// Create and write file
-		targetFile, err := os.Create(targetPath)
-		if err != nil {
-			return fmt.Errorf("creating file %q: %w", targetPath, err)
-		}
-		defer targetFile.Close()
+			srcFile, err := worktreeFS.Open(filePath)
+			if err != nil {
+				return fmt.Errorf("opening %q: %w", filePath, err)
+			}
 
-		if _, err := io.Copy(targetFile, fileReader); err != nil {
-			return fmt.Errorf("copying file %q: %w", filePath, err)
-		}
+			dstFile, err := os.Create(targetPath)
+			if err != nil {
+				srcFile.Close()
+				return fmt.Errorf("creating file %q: %w", targetPath, err)
+			}
 
-		tfFiles = append(tfFiles, targetPath)
-		logger.Debug(fmt.Sprintf("Extracted terraform file: %q", filePath))
+			_, copyErr := io.Copy(dstFile, srcFile)
+			srcFile.Close()
+			dstFile.Close()
+			if copyErr != nil {
+				return fmt.Errorf("copying file %q: %w", filePath, copyErr)
+			}
+
+			tfFiles = append(tfFiles, targetPath)
+			logger.Debug(fmt.Sprintf("Extracted terraform file: %q", filePath))
+		}
 		return nil
-	})
+	}
 
-	if err != nil {
+	if err := walk(""); err != nil {
 		return nil, err
 	}
 
@@ -187,40 +215,35 @@ func extractTerraformFiles(gitRepo *git.Repository, targetDir string, tfPath str
 	return tfFiles, nil
 }
 
-// setupTerraformConfigFile checks for .terraformrc in workDir and sets TF_CLI_CONFIG_FILE env var if found
+// setupTerraformConfigFile sets TF_CLI_CONFIG_FILE on the command.
+// Uses a relative path (".terraformrc") so it works both on the host
+// filesystem and inside the pivot_root'd sandbox (CWD = /workspace).
+// Host TF_CLI_CONFIG_FILE takes priority when running without rootfs
+// isolation; inside the sandbox it is ignored because the host path
+// would not exist after pivot_root.
 func setupTerraformConfigFile(workDir string, cmd *exec.Cmd) {
-	tfConfig := os.Getenv("TF_CLI_CONFIG_FILE")
-	// Env exists, use env value
-	if tfConfig != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TF_CLI_CONFIG_FILE=%s", tfConfig))
+	if v := os.Getenv("TF_CLI_CONFIG_FILE"); v != "" {
+		cmd.Env = append(cmd.Env, "TF_CLI_CONFIG_FILE="+v)
 		return
 	}
 	terraformrcPath := filepath.Join(workDir, ".terraformrc")
 	if _, err := os.Stat(terraformrcPath); err == nil {
-		// File exists, set environment variable
-		cmd.Env = append(cmd.Env, fmt.Sprintf("TF_CLI_CONFIG_FILE=%s", terraformrcPath))
+		cmd.Env = append(cmd.Env, "TF_CLI_CONFIG_FILE=.terraformrc")
 	}
 }
 
-// runTerraformInit runs terraform init
 func runTerraformInit(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "init", "-no-color", "-input=false")
-	cmd.Dir = workDir
+	cmd, err := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "init", "-no-color", "-input=false")
+	if err != nil {
+		return err
+	}
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -237,34 +260,18 @@ func runTerraformInit(ctx context.Context, workDir string, config CLIConfig) err
 	return nil
 }
 
-// runTerraformPlan runs terraform plan
 func runTerraformPlan(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "plan", "-no-color", "-input=false", "-out=tfplan")
-	cmd.Dir = workDir
+	cmd, err := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "plan", "-no-color", "-input=false", "-out=tfplan")
+	if err != nil {
+		return err
+	}
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-	if config.VaultAddr != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_ADDR=%s", config.VaultAddr))
-	}
-	if config.VaultToken != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_TOKEN=%s", config.VaultToken))
-	}
-	if config.VaultNamespace != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_NAMESPACE=%s", config.VaultNamespace))
-	}
-
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -281,34 +288,18 @@ func runTerraformPlan(ctx context.Context, workDir string, config CLIConfig) err
 	return nil
 }
 
-// runTerraformApply runs terraform apply with the plan file and returns the state
-// State is returned even if apply failed, so it can be saved for debugging/recovery
 func runTerraformApply(ctx context.Context, workDir string, config CLIConfig) error {
 	tfBinary, err := getTfBinary(config)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, tfBinary, "apply", "-no-color", "-input=false", "-auto-approve", "tfplan")
-	cmd.Dir = workDir
+	cmd, err := newTerraformCommand(ctx, workDir, config, config.Logger, tfBinary, "apply", "-no-color", "-input=false", "-auto-approve", "tfplan")
+	if err != nil {
+		return err
+	}
+	setupTerraformConfigFile(workDir, cmd)
 	cmd.Stdout = io.Discard
 
-	// Copy existing environment variables
-	cmd.Env = os.Environ()
-	if config.VaultAddr != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_ADDR=%s", config.VaultAddr))
-	}
-	if config.VaultToken != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_TOKEN=%s", config.VaultToken))
-	}
-	if config.VaultNamespace != "" {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("VAULT_NAMESPACE=%s", config.VaultNamespace))
-	}
-	// Setup terraform config file if exists
-	setupTerraformConfigFile(workDir, cmd)
-
-	cmd.Env = append(cmd.Env, "TF_IN_AUTOMATION=true")
-
-	// Capture stderr to get error details
 	var stderrBuf strings.Builder
 	cmd.Stderr = &stderrBuf
 
@@ -325,8 +316,7 @@ func runTerraformApply(ctx context.Context, workDir string, config CLIConfig) er
 	return nil
 }
 
-// loadTerraformState loads terraform state from storage and writes it to workDir
-func loadTerraformState(ctx context.Context, workDir string, config CLIConfig) error {
+func loadTerraformState(ctx context.Context, statePath string, config CLIConfig) error {
 	if config.Storage == nil {
 		config.Logger.Debug("Storage not provided, skipping state load")
 		return nil
@@ -342,8 +332,6 @@ func loadTerraformState(ctx context.Context, workDir string, config CLIConfig) e
 		return nil
 	}
 
-	// Write state file to workDir
-	statePath := filepath.Join(workDir, "terraform.tfstate")
 	if err := os.WriteFile(statePath, entry.Value, 0600); err != nil {
 		return fmt.Errorf("writing terraform state file: %w", err)
 	}
@@ -430,10 +418,7 @@ func verifyTfBinarySHA256(path, expectedHex string) error {
 		return fmt.Errorf("reading terraform binary for checksum: %w", err)
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	expected := strings.ToLower(strings.TrimSpace(expectedHex))
-	if strings.HasPrefix(expected, "0x") {
-		expected = expected[2:]
-	}
+	expected := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(expectedHex)), "0x")
 	if got != expected {
 		return fmt.Errorf("terraform binary SHA256 mismatch at %q: got %s, expected %s", path, got, expectedHex)
 	}

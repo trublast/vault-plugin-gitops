@@ -1,3 +1,4 @@
-./gitops
-./gitops-tool
+gitops
+gitops-tool
 dist/
+pkg/terraform/sandbox-init/bin/

@@ -1,10 +1,12 @@
+//go:build linux
+
 package terraform
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/go-git/go-git/v6"
+	"github.com/go-git/go-billy/v6"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -19,7 +21,7 @@ func init() {
 
 type engineImpl struct{}
 
-func (e *engineImpl) ProcessCommit(ctx context.Context, storage logical.Storage, gitRepo *git.Repository, logger hclog.Logger) error {
+func (e *engineImpl) ProcessCommit(ctx context.Context, storage logical.Storage, worktreeFS billy.Filesystem, logger hclog.Logger) error {
 	vaultConfig, err := vault_client.GetConfig(ctx, storage)
 	if err != nil {
 		return fmt.Errorf("unable to get vault configuration: %w", err)
@@ -41,7 +43,7 @@ func (e *engineImpl) ProcessCommit(ctx context.Context, storage logical.Storage,
 		Storage:        storage,
 		Logger:         logger,
 	}
-	if err := ApplyTerraformFromRepo(ctx, gitRepo, cliCfg); err != nil {
+	if err := ApplyTerraformFromFS(ctx, worktreeFS, cliCfg); err != nil {
 		return fmt.Errorf("terraform apply: %w", err)
 	}
 	return nil

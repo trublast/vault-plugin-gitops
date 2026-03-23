@@ -7,18 +7,27 @@ LDFLAGS      := -s -w
 
 PLUGIN_LDFLAGS := $(LDFLAGS) -X github.com/trublast/vault-plugin-gitops.projectVersion=$(VERSION)
 
-.PHONY: all build build-tool clean test e2e
+.PHONY: all build build-tool clean test e2e build-sandbox-init
 
 all: build build-tool
 
+# Build the plugin (requires: make build-sandbox-init first).
 build:
-	go build -ldflags '$(PLUGIN_LDFLAGS)' -o $(BINARY_NAME) ./cmd/plugin-gitops
+	GOOS=linux go build -ldflags '$(PLUGIN_LDFLAGS)' -o $(BINARY_NAME) ./cmd/plugin-gitops
 
 build-gitops-only:
 	go build -tags no_terraform -ldflags '$(PLUGIN_LDFLAGS)' -o $(BINARY_NAME) ./cmd/plugin-gitops
 
 build-terraform-only:
 	GOOS=linux go build -tags no_gitops -ldflags '$(PLUGIN_LDFLAGS)' -o $(BINARY_NAME) ./cmd/plugin-gitops
+
+# Compile the C sandbox-init helper for amd64 and arm64 (static musl).
+# Requires musl cross-compilers or use: make build-sandbox-init-docker
+build-sandbox-init:
+	$(MAKE) -C pkg/terraform/sandbox-init all
+
+build-sandbox-init-docker:
+	$(MAKE) -C pkg/terraform/sandbox-init docker
 
 build-tool:
 	go build -ldflags '$(LDFLAGS) -X main.projectVersion=$(VERSION)' -o $(TOOL_BINARY) ./cmd/tool
